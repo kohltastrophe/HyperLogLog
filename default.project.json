@@ -1,0 +1,6 @@
+{
+	"name": "HyperLogLog",
+	"tree": {
+		"$path": "src"
+	}
+}
