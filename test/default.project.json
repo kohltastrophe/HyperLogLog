@@ -1,0 +1,12 @@
+{
+	"name": "Test HyperLogLog",
+	"emitLegacyScripts": false,
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"HyperLogLog": {
+				"$path": "../src"
+			}
+		}
+	}
+}
