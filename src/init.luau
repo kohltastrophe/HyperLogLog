@@ -966,7 +966,7 @@ local linearCountingThresholdLookup = {
 
 local function linearCountingThreshold(p: number)
 	if MINIMUM_PRECISION <= p and p <= MAXIMUM_PRECISION then
-		return linearCountingThresholdLookup[p - MINIMUM_PRECISION]
+		return linearCountingThresholdLookup[p - MINIMUM_PRECISION + 1]
 	end
 	return 5 * 2 ^ p / 2
 end
