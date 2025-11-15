@@ -62,13 +62,15 @@ print("Estimated unique items: " .. uniqueCount)
 
 ## 📚 API Reference
 
-### `HyperLogLog.new(precision)`
+### `HyperLogLog.new(precision, seed)`
 
 Creates a new, empty HyperLogLog counter.
 
 - **`precision`** (number?): An integer between 4 and 18. This defines the accuracy and memory usage. It defaults to `14`.
   - Memory usage is $2^p$ (e.g., `p=14` uses $2^{14} = 16384$ registers).
   - Standard error is $\approx 1.04 / \sqrt{2^p}$.
+- **`seed`** (number?): A 32 bit integer.
+  - Used to prevent accidentally merging counters from different groupings.
 - **Returns**: (HyperLogLog): A new counter object.
 
 ---

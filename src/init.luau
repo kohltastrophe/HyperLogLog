@@ -1021,26 +1021,30 @@ type HLL = {
 	buffer: buffer,
 	m: number,
 	p: number,
+	seed: number,
 }
 type HyperLogLog = typeof(setmetatable({} :: HLL, HyperLogLog))
 
-local OFFSET_REGISTERS = 1
+local OFFSET_REGISTERS = 5
 
 --- Creates a new HyperLogLog counter.
 --- @param precision (p) -- An integer between 4 and 18. Defaults to 14.
+--- @param seed -- A 32 bit integer.
 --- @return HyperLogLog Object
-function HyperLogLog.new(precision: number?): HyperLogLog
+function HyperLogLog.new(precision: number?, seed: number?): HyperLogLog
 	local p = math.clamp(precision or 14, 4, 18)
 	local m = 2 ^ p
 
 	local b = buffer.create(OFFSET_REGISTERS + m)
 	buffer.writeu8(b, 0, p)
+	buffer.writeu32(b, 1, seed or 0)
 
 	return setmetatable({
 		alpha = getAlpha(m) * m ^ 2,
 		buffer = b,
 		m = m,
 		p = p,
+		seed = seed or 0,
 	}, HyperLogLog)
 end
 
@@ -1115,8 +1119,8 @@ end
 
 --- Merges another HLL counter into this one. Both counters must have the same precision (p).
 function HyperLogLog.merge(self: HLL, other: HLL)
-	if not other or self.p ~= other.p then
-		warn("Cannot merge HyperLogLog objects with different precision")
+	if not other or self.p ~= other.p or self.seed ~= other.seed then
+		warn("Cannot merge HyperLogLog objects with different precision or seed")
 		return
 	end
 
@@ -1139,7 +1143,9 @@ function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 		return nil
 	end
 
-	local ok, p = pcall(buffer.readu8, data, 0)
+	local ok, p, seed = pcall(function()
+		return buffer.readu8(data, 0), buffer.readu32(data, 1)
+	end)
 
 	if not ok then
 		warn("Failed to deserialize HyperLogLog: buffer is corrupted or too small")
@@ -1158,6 +1164,7 @@ function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 		buffer = data,
 		m = m,
 		p = p,
+		seed = seed,
 	}, HyperLogLog)
 end
 
