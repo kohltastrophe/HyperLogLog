@@ -1071,16 +1071,38 @@ function HyperLogLog.estimate(self: HLL): number
 
 	local b = self.buffer
 	local m = self.m
-	local readu8 = buffer.readu8
 	local lookup = POW_2_NEG
+	local band = bit32.band
+	local rshift = bit32.rshift
+	local readu32 = buffer.readu32
 
 	-- Accumulate the harmonic sum of register values (2^-reg)
-	for i = OFFSET_REGISTERS, OFFSET_REGISTERS + m - 1 do
-		local val = readu8(b, i)
-		if val == 0 then
+	for i = OFFSET_REGISTERS, OFFSET_REGISTERS + m - 1, 4 do
+		local chunk = readu32(b, i)
+
+		local v1 = band(chunk, 0xFF)
+		if v1 == 0 then
 			nZeros += 1
 		end
-		sum += lookup[val + 1]
+		sum += lookup[v1 + 1]
+
+		local v2 = band(rshift(chunk, 8), 0xFF)
+		if v2 == 0 then
+			nZeros += 1
+		end
+		sum += lookup[v2 + 1]
+
+		local v3 = band(rshift(chunk, 16), 0xFF)
+		if v3 == 0 then
+			nZeros += 1
+		end
+		sum += lookup[v3 + 1]
+
+		local v4 = rshift(chunk, 24)
+		if v4 == 0 then
+			nZeros += 1
+		end
+		sum += lookup[v4 + 1]
 	end
 
 	-- Small Range Correction: Use Linear Counting if the estimate is low
