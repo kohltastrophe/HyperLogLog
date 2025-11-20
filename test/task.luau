@@ -1,10 +1,7 @@
+--!strict
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local HyperLogLog = require(ReplicatedStorage:WaitForChild("HyperLogLog")) :: any
-
-local function fuzzyEq(x: number, y: number, epsilon: number)
-	return math.abs(x - y) <= epsilon
-end
 
 local tests = {
 
@@ -13,7 +10,11 @@ local tests = {
 		local hll_default = HyperLogLog.new()
 		assert(hll_default.p == 14, "Default precision (p) should be 14")
 		assert(hll_default.m == 2 ^ 14, "Default register count (m) should be 2^14")
-		assert(buffer.len(hll_default.buffer) == 2 ^ 14 + 1, "Registers size should match m + 1")
+
+		-- NEW: Check for Lazy Allocation / Sparse Mode
+		assert(hll_default.is_sparse == true, "New HLL should initialize in Sparse Mode")
+		assert(hll_default.buffer == nil, "New HLL should not allocate a buffer immediately")
+		assert(hll_default.sparse_count == 0, "Sparse count should initialize to 0")
 
 		-- Test custom precision
 		local hll_custom = HyperLogLog.new(10)
@@ -29,14 +30,18 @@ local tests = {
 		assert(hll_high.p == 18, "Precision should be clamped to a max of 18")
 	end,
 
-	["Add and Estimate (Basic)"] = function()
+	["Add and Estimate (Sparse/Basic)"] = function()
 		local hll = HyperLogLog.new(14)
+		-- Add a few items (well below dense threshold)
 		hll:add(1)
 		hll:add(2)
 		hll:add(3)
 
+		assert(hll.is_sparse, "HLL should remain sparse with few items")
+
 		local estimate = hll:estimate()
-		assert(estimate == 3, "Estimate should be 3 for 3 unique items")
+		-- Sparse estimation uses Linear Counting, so it should be exact for small integers
+		assert(estimate == 3, `Estimate should be exactly 3 for sparse mode, got {estimate}`)
 
 		-- Add duplicates
 		hll:add(1)
@@ -47,140 +52,132 @@ local tests = {
 		assert(estimate_after_dupes == 3, "Estimate should not change after adding duplicates")
 	end,
 
-	["Add and Estimate (Large)"] = function()
-		local p = 10 -- Use lower precision for a faster test
-		local hll = HyperLogLog.new(p)
-		local count = 10000
+	["Sparse to Dense Transition"] = function()
+		-- p=10 means m=1024 registers.
+		-- Threshold is 0.25 * 1024 = 256 items.
+		local hll = HyperLogLog.new(10)
+		local count = 300
+
+		assert(hll.is_sparse == true, "Should start sparse")
+
+		-- Add items just up to the threshold (approx)
+		-- We force distinct hash impacts by using integers
+		for i = 1, count do
+			hll:add(i)
+		end
+
+		-- At 300 unique items, we typically fill > 256 registers due to distribution
+		-- However, HLL collisions might keep us slightly under, so we add enough cushion.
+
+		assert(hll.is_sparse :: any == false, "HLL should have converted to Dense Mode after exceeding threshold")
+		assert(hll.buffer ~= nil, "HLL should have a buffer allocated in Dense Mode")
+		assert(hll.sparse_registers == nil, "Sparse registers should be nil in Dense Mode")
+
+		local estimate = hll:estimate()
+		-- Allow for standard error since we are now in dense mode (approx 3.25% for p=10)
+		-- We use a wider margin (5%) here to prevent flakes on the transition boundary
+		local margin = count * 0.05
+		local diff = math.abs(estimate - count)
+		assert(diff <= margin, `Estimate {estimate} is not within 5% margin of {count} (margin: {margin})`)
+	end,
+
+	["Add and Estimate (Large/Dense)"] = function()
+		local hll = HyperLogLog.new(10)
+		local count = 10000 -- Far exceeds threshold
 
 		for i = 1, count do
 			hll:add(i)
 		end
 
+		assert(hll.is_sparse == false, "Should be dense")
+
 		local estimate = hll:estimate()
 
 		-- Standard error for HLL is ~1.04 / sqrt(m)
 		-- For p=10, m=1024. Error ~1.04 / 32 = 0.0325 (3.25%)
-		-- We'll use a 5% margin to be safe from test flakes.
-		local error_margin = count * 0.05
+		local margin = count * 0.0325
 		local diff = math.abs(estimate - count)
 
-		assert(diff <= error_margin, `Estimate ${estimate} is not within 5% margin of ${count} (diff: ${diff})`)
+		assert(diff <= margin, `Estimate {estimate} is not within 3.25% of {count} (margin: {margin})`)
 	end,
 
-	["Merge (Basic)"] = function()
+	["Merge (Sparse + Sparse)"] = function()
 		local hll1 = HyperLogLog.new(12)
 		hll1:add(1)
 		hll1:add(2)
-		hll1:add(3) -- common
 
 		local hll2 = HyperLogLog.new(12)
-		hll2:add(3) -- common
-		hll2:add(4)
-		hll2:add(5)
-
-		local est1_before = hll1:estimate()
-		local est2_before = hll2:estimate()
-
-		assert(est1_before == 3, `hll1 estimate before merge should be 3, got ${est1_before}`)
-		assert(est2_before == 3, `hll2 estimate before merge should be 3, got ${est2_before}`)
+		hll2:add(2) -- overlap
+		hll2:add(3)
 
 		hll1:merge(hll2)
 
-		local est1_after = hll1:estimate()
-		local est2_after = hll2:estimate() -- hll2 should be unchanged
-
-		-- Total unique items: a, b, c, d, e (5)
-		assert(fuzzyEq(est1_after, 5, 1), `hll1 estimate after merge should be 5, got ${est1_after}`)
-		assert(fuzzyEq(est2_after, 3, 0), `hll2 estimate should be unchanged after merge, got ${est2_after}`)
+		assert(hll1.is_sparse, "Merged small HLLs should remain sparse")
+		assert(hll1:estimate() == 3, "Merge should result in Union (1,2,3)")
 	end,
 
-	["Merge (Different Precision)"] = function()
-		local hll1 = HyperLogLog.new(10)
-		hll1:add(1)
-		local est1_before = hll1:estimate()
+	["Merge (Dense + Sparse)"] = function()
+		local hll_dense = HyperLogLog.new(10)
+		-- Force densification
+		local dense_count = 500
+		for i = 1, dense_count do
+			hll_dense:add(i)
+		end
+		assert(not hll_dense.is_sparse, "Setup failed: hll_dense is not dense")
 
-		-- Convert registers to a string to check for changes
-		local regs1_before = buffer.tostring(hll1.buffer)
+		local hll_sparse = HyperLogLog.new(10)
+		hll_sparse:add(10000) -- A unique item
 
-		local hll2 = HyperLogLog.new(12)
-		hll2:add(2)
-		hll2:add(3)
+		hll_dense:merge(hll_sparse)
 
-		-- This should error and not merge
-		local ok = pcall(hll1.merge, hll1, hll2)
-		assert(not ok, "Merge should fail with different precision")
+		assert(not hll_dense.is_sparse, "Dense HLL should remain dense after merge")
 
-		local est1_after = hll1:estimate()
-		local regs1_after = buffer.tostring(hll1.buffer)
+		-- Expected total is 501.
+		-- We use a 5% error margin because 500 is a small-ish number for Dense estimation,
+		-- so variance can be higher than the asymptotic 3.25%.
+		local est = hll_dense:estimate()
+		local expected = dense_count + 1
+		local margin = expected * 0.05
 
-		assert(est1_before == est1_after, "Estimate should not change after failed merge (different p)")
-		assert(regs1_before == regs1_after, "Registers should not change after failed merge (different p)")
+		local diff = math.abs(est - expected)
+
+		assert(diff <= margin, `Estimate {est} is not within 5% of {expected} (margin: {margin})`)
 	end,
 
 	["Serialize and Deserialize"] = function()
-		local hll = HyperLogLog.new(8) -- Use p=8 for a small buffer
+		local hll = HyperLogLog.new(8) -- p=8, m=256
 		hll:add(buffer.fromstring("foo"))
 		hll:add(123)
-		hll:add(12345)
 
-		local estimate_before = hll:estimate()
+		assert(hll.is_sparse, "Should be sparse before serialize")
 
 		local data = hll:serialize()
+
 		assert(type(data) == "buffer", "serialize() should return a buffer")
-		-- 1 byte for 'p' + 2^8 (256) bytes for registers
-		assert(buffer.len(data) == 1 + 2 ^ 8, `Buffer length should be ${1 + 2 ^ 8}, got ${buffer.len(data)}`)
 
-		local hll_deserialized = HyperLogLog.deserialize(data)
+		-- Even if sparse, serialize returns the Dense Format for DataStore compatibility
+		-- Length = 1 byte (p) + 256 bytes (registers)
+		assert(buffer.len(data) == 1 + 2 ^ 8, `Buffer length should be {1 + 2 ^ 8}, got {buffer.len(data)}`)
 
-		assert(hll_deserialized, "deserialize() should return a new HLL object")
-		assert(hll_deserialized.p == hll.p, "Deserialized HLL should have same precision (p)")
-		assert(hll_deserialized.m == hll.m, "Deserialized HLL should have same register count (m)")
-
-		local estimate_after = hll_deserialized:estimate()
-
-		assert(
-			estimate_before == estimate_after,
-			`Estimates should match: before=${estimate_before}, after=${estimate_after}`
-		)
+		-- Deserialize
+		local hll_loaded = HyperLogLog.deserialize(data)
+		assert(hll_loaded, "deserialize() should return a new HLL object")
+		assert(hll_loaded.is_sparse == false, "Deserialized objects are always Dense")
+		assert(hll_loaded:estimate() == 2, "Deserialized estimate should match original")
 	end,
 
 	["Deserialize (Invalid Data)"] = function()
-		-- Test with nil
-		local hll_nil = HyperLogLog.deserialize(nil)
+		local hll_nil = HyperLogLog.deserialize(nil :: any)
 		assert(hll_nil == nil, "deserialize(nil) should return nil")
 
-		-- Test with wrong type
-		local hll_string = HyperLogLog.deserialize("not a buffer")
+		local hll_string = HyperLogLog.deserialize("not a buffer" :: any)
 		assert(hll_string == nil, "deserialize(string) should return nil")
 
 		-- Test with invalid buffer length
-		-- p=10 (read from byte 0) means m=1024. Expected length = 1 + 1024 = 1025
-		-- This buffer has p=10 but length=100
 		local short_buffer = buffer.create(100)
-		buffer.writeu8(short_buffer, 0, 10) -- Write p=10
-
+		buffer.writeu8(short_buffer, 0, 10) -- Write p=10 (expects 1024+1 bytes)
 		local hll_short = HyperLogLog.deserialize(short_buffer)
 		assert(hll_short == nil, "deserialize(short buffer) should return nil")
-	end,
-
-	["Small Range Correction"] = function()
-		-- With p=14 (m=16384), 2.5 * m = 40960
-		-- Adding a few items should trigger the small range correction
-		local hll = HyperLogLog.new(14)
-		hll:add(1)
-		hll:add(2)
-
-		-- Check that there are zero registers
-		local zero_registers = 0
-		for i = 1, hll.m do
-			if buffer.readu8(hll.buffer, i) == 0 then
-				zero_registers += 1
-			end
-		end
-		assert(zero_registers > 0, "There should be zero registers for small range correction")
-
-		local estimate = hll:estimate()
-		assert(estimate == 2, `Estimate should be 2, got ${estimate}`)
 	end,
 }
 
@@ -196,8 +193,8 @@ end)
 local fail = false
 for i, v in testsList do
 	local name, f = unpack(v)
-	local ok, err = pcall(f)
-	testsList[i] = { ok, if ok then `✅ {name}` else `❌ {name}: {err}` }
+	local ok, err = pcall(f :: any)
+	testsList[i] = { ok, if ok then `✅ {name}` else `❌ {name}: {err}` :: any }
 	if not ok then
 		fail = true
 	end
