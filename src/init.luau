@@ -930,32 +930,11 @@ local BIAS_DATA = table.freeze({
 	}
 })
 
---- Finds the insertion index for a value in a sorted array.
-local function binarySearch(tbl, value: number)
-	local low, high = 1, #tbl
-
-	while low <= high do
-		local mid = math.floor((low + high) / 2)
-		local v: number = tbl[mid]
-		if v == value then
-			return mid + 1
-		elseif v < value then
-			low = mid + 1
-		else
-			high = mid - 1
-		end
-	end
-
-	return low
-end
-
-local OFFSET_REGISTERS = 1
-local DENSE_THRESHOLD_RATIO = 1 / 8
-
 local MINIMUM_PRECISION = 4
 local MAXIMUM_PRECISION = 18
 
 local SPARSE_PRECISION = 25
+local DENSE_THRESHOLD_RATIO = 1 / 8
 
 local COUNTING_THRESHOLD = table.freeze({
 	10, -- precision 4
@@ -979,7 +958,6 @@ local function linearCountingThreshold(p: number)
 	if MINIMUM_PRECISION <= p and p <= MAXIMUM_PRECISION then
 		return COUNTING_THRESHOLD[p - MINIMUM_PRECISION + 1]
 	end
-
 	return 5 * 2 ^ p / 2
 end
 
@@ -995,30 +973,35 @@ local function getAlpha(m: number): number
 	end
 end
 
-local function denseBuffer(hll: HyperLogLog): buffer
-	local b = buffer.create(OFFSET_REGISTERS + hll.m)
-	buffer.writeu8(b, 0, hll.p)
+local function getDenseBuffer(hll: HyperLogLog): buffer
+	local band = bit32.band
+	local countlz = bit32.countlz
+	local lshift = bit32.lshift
+	local rshift = bit32.rshift
+	local readu8 = buffer.readu8
+	local writeu8 = buffer.writeu8
+
+	local b = buffer.create(1 + hll.m)
+	writeu8(b, 0, hll.p)
 
 	local diff = hll.dense_diff
 	local mask = hll.dense_mask
 	local shift_fix = hll.dense_shift_fix
-	local offset = OFFSET_REGISTERS
 
 	for index_sparse, rho_sparse in hll.sparse_registers :: any do
-		local index_dense = bit32.rshift(index_sparse, diff)
-
-		local residual = bit32.band(index_sparse, mask)
+		local index_dense = rshift(index_sparse, diff)
+		local residual = band(index_sparse, mask)
 
 		local rho_dense
 		if residual == 0 then
 			rho_dense = rho_sparse + diff
 		else
-			rho_dense = bit32.countlz(bit32.lshift(residual, shift_fix)) + 1
+			rho_dense = countlz(lshift(residual, shift_fix)) + 1
 		end
 
-		local ptr = index_dense + offset
-		if rho_dense > buffer.readu8(b, ptr) then
-			buffer.writeu8(b, ptr, rho_dense)
+		local ptr = index_dense + 1
+		if rho_dense > readu8(b, ptr) then
+			writeu8(b, ptr, rho_dense)
 		end
 	end
 
@@ -1030,8 +1013,7 @@ local function toDense(hll: HyperLogLog)
 		return
 	end
 
-	hll.buffer = denseBuffer(hll)
-
+	hll.buffer = getDenseBuffer(hll)
 	table.clear(hll.sparse_registers :: any)
 
 	hll.is_sparse = false
@@ -1062,17 +1044,13 @@ export type HLL = {
 }
 export type HyperLogLog = typeof(setmetatable({} :: HLL, HyperLogLog))
 
---- Creates a new HyperLogLog counter.
---- @param precision (p) -- An integer between 4 and 18. Defaults to 14.
---- @return HyperLogLog Object
-function HyperLogLog.new(precision: number?): HyperLogLog
+local function newRaw(precision: number?): HLL
 	local p = math.clamp(precision or 14, 4, 18)
 	local m = 2 ^ p
-
 	local p_prime = SPARSE_PRECISION
 	local m_prime = 2 ^ p_prime
 
-	return setmetatable({
+	return {
 		p = p,
 		m = m,
 		alpha = getAlpha(m) * m ^ 2,
@@ -1089,7 +1067,14 @@ function HyperLogLog.new(precision: number?): HyperLogLog
 		dense_diff = p_prime - p,
 		dense_mask = bit32.lshift(1, p_prime - p) - 1,
 		dense_shift_fix = 32 - (p_prime - p),
-	}, HyperLogLog)
+	}
+end
+
+--- Creates a new HyperLogLog counter.
+--- @param precision (p) -- An integer between 4 and 18. Defaults to 14.
+--- @return HyperLogLog Object
+function HyperLogLog.new(precision: number?): HyperLogLog
+	return setmetatable(newRaw(precision), HyperLogLog)
 end
 
 local temp = buffer.create(8)
@@ -1127,7 +1112,7 @@ function HyperLogLog.add(self: HyperLogLog, item: buffer | number)
 			end
 		end
 	else
-		local index = bit32.rshift(hi, self.shift_p) + OFFSET_REGISTERS
+		local index = bit32.rshift(hi, self.shift_p) + 1
 		local witness_hi = bit32.band(hi, self.witness_mask)
 
 		local rho
@@ -1145,11 +1130,8 @@ end
 
 --- Estimates the current unique count (cardinality).
 function HyperLogLog.estimate(self: HyperLogLog): number
-	local m = self.m
-	local nZeros
-
 	if self.is_sparse then
-		nZeros = self.m_prime - self.sparse_count
+		local nZeros = self.m_prime - self.sparse_count
 		if nZeros > 0 then
 			return math.round(self.m_prime * math.log(self.m_prime / nZeros))
 		else
@@ -1157,37 +1139,37 @@ function HyperLogLog.estimate(self: HyperLogLog): number
 		end
 	end
 
+	local m = self.m
 	local sum = 0
-	nZeros = 0
+	local nZeros = 0
 
 	local b = self.buffer :: buffer
 	local lookup = POW_2_NEG
-	local band = bit32.band
-	local rshift = bit32.rshift
+	local extract = bit32.extract
 	local readu32 = buffer.readu32
 
-	for i = OFFSET_REGISTERS, OFFSET_REGISTERS + m - 1, 4 do
+	for i = 1, m, 4 do
 		local chunk = readu32(b, i)
 
-		local v1 = band(chunk, 0xFF)
+		local v1 = extract(chunk, 0, 8)
 		if v1 == 0 then
 			nZeros += 1
 		end
 		sum += lookup[v1 + 1]
 
-		local v2 = band(rshift(chunk, 8), 0xFF)
+		local v2 = extract(chunk, 8, 8)
 		if v2 == 0 then
 			nZeros += 1
 		end
 		sum += lookup[v2 + 1]
 
-		local v3 = band(rshift(chunk, 16), 0xFF)
+		local v3 = extract(chunk, 16, 8)
 		if v3 == 0 then
 			nZeros += 1
 		end
 		sum += lookup[v3 + 1]
 
-		local v4 = rshift(chunk, 24)
+		local v4 = extract(chunk, 24, 8)
 		if v4 == 0 then
 			nZeros += 1
 		end
@@ -1209,15 +1191,28 @@ function HyperLogLog.estimate(self: HyperLogLog): number
 		local biases = BIAS_DATA[i]
 
 		if means then
-			local index = binarySearch(means, estimate)
+			local low = 1
+			local high = #means
 
-			if index == 1 then
+			while low <= high do
+				local mid = math.floor((low + high) / 2)
+				local v: number = means[mid]
+				if v == estimate then
+					return mid + 1
+				elseif v < estimate then
+					low = mid + 1
+				else
+					high = mid - 1
+				end
+			end
+
+			if low == 1 then
 				estimate -= biases[1]
-			elseif index > #means then
+			elseif low > #means then
 				estimate -= biases[#means]
 			else
-				local x1, x2 = means[index - 1], means[index]
-				local y1, y2 = biases[index - 1], biases[index]
+				local x1, x2 = means[low - 1], means[low]
+				local y1, y2 = biases[low - 1], biases[low]
 				estimate -= y1 + (y2 - y1) * ((estimate - x1) / (x2 - x1))
 			end
 		end
@@ -1252,25 +1247,33 @@ function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 		return
 	end
 
-	if self.is_sparse and not other.is_sparse then
+	if self.is_sparse then
 		toDense(self)
 	end
 
-	if not self.is_sparse and other.is_sparse then
+	local readu8 = buffer.readu8
+	local writeu8 = buffer.writeu8
+
+	if other.is_sparse then
 		local b = self.buffer :: buffer
+		local p_prime = other.p_prime
+		local p = other.p
+		local diff = p_prime - p
+		local rshift = bit32.rshift
+
 		for idx_sparse, rho_sparse in other.sparse_registers :: { [number]: number } do
-			local idx_dense = bit32.rshift(idx_sparse, other.p_prime - other.p) + OFFSET_REGISTERS
-			local rho_dense = rho_sparse + (other.p_prime - other.p)
-			if rho_dense > buffer.readu8(b, idx_dense) then
-				buffer.writeu8(b, idx_dense, rho_dense)
+			local idx_dense = rshift(idx_sparse, p_prime - p) + 1
+			local rho_dense = rho_sparse + diff
+			if rho_dense > readu8(b, idx_dense) then
+				writeu8(b, idx_dense, rho_dense)
 			end
 		end
 		return
 	end
 
-	local readu8, writeu8 = buffer.readu8, buffer.writeu8
-	local b1, b2 = self.buffer :: buffer, other.buffer :: buffer
-	for i = OFFSET_REGISTERS, OFFSET_REGISTERS + self.m - 1 do
+	local b1 = self.buffer :: buffer
+	local b2 = other.buffer :: buffer
+	for i = 1, self.m do
 		local rho = readu8(b2, i)
 		if rho > readu8(b1, i) then
 			writeu8(b1, i, rho)
@@ -1281,7 +1284,7 @@ end
 --- Returns a serialized buffer.
 function HyperLogLog.serialize(self: HyperLogLog): buffer
 	if self.is_sparse then
-		return denseBuffer(self)
+		return getDenseBuffer(self)
 	else
 		local b = buffer.create(buffer.len(self.buffer :: buffer))
 		buffer.copy(b, 0, self.buffer :: buffer)
@@ -1305,32 +1308,17 @@ function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 	end
 
 	local m = 2 ^ p
-	if buffer.len(data) ~= OFFSET_REGISTERS + m then
-		warn(`Expected buffer length of {OFFSET_REGISTERS + m}, got {buffer.len(data)}`)
+	if buffer.len(data) ~= 1 + m then
+		warn(`Expected buffer length of {1 + m}, got {buffer.len(data)}`)
 		return nil
 	end
 
-	local p_prime = SPARSE_PRECISION
-	local m_prime = 2 ^ p_prime
+	local hll = newRaw(p)
+	hll.buffer = data
+	hll.is_sparse = false
+	hll.sparse_registers = nil
 
-	return setmetatable({
-		p = p,
-		m = m,
-		alpha = getAlpha(m) * m ^ 2,
-		buffer = data,
-		is_sparse = false,
-		sparse_registers = nil,
-		sparse_count = 0,
-		shift_p = 32 - p,
-		witness_mask = bit32.lshift(1, 32 - p) - 1,
-		p_prime = p_prime,
-		m_prime = m_prime,
-		shift_p_prime = 32 - p_prime,
-		witness_mask_prime = bit32.lshift(1, 32 - p_prime) - 1,
-		dense_diff = p_prime - p,
-		dense_mask = bit32.lshift(1, p_prime - p) - 1,
-		dense_shift_fix = 32 - (p_prime - p),
-	}, HyperLogLog)
+	return setmetatable(hll, HyperLogLog)
 end
 
 return HyperLogLog
