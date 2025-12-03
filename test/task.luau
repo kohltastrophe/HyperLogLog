@@ -155,14 +155,16 @@ local tests = {
 
 		assert(type(data) == "buffer", "serialize() should return a buffer")
 
-		-- Even if sparse, serialize returns the Dense Format for DataStore compatibility
-		-- Length = 1 byte (p) + 256 bytes (registers)
-		assert(buffer.len(data) == 1 + 2 ^ 8, `Buffer length should be {1 + 2 ^ 8}, got {buffer.len(data)}`)
+		-- The buffer should be much smaller than the Dense Format (1 + 256 bytes)
+		-- Header (1) + Count (4) + ~2-4 bytes per item
+		assert(buffer.len(data) < 1 + 2 ^ 8, `Sparse buffer should be compressed, got length {buffer.len(data)}`)
 
 		-- Deserialize
 		local hll_loaded = HyperLogLog.deserialize(data)
 		assert(hll_loaded, "deserialize() should return a new HLL object")
-		assert(hll_loaded.is_sparse == false, "Deserialized objects are always Dense")
+
+		-- Updated Expectation: Deserializing sparse data should return a sparse object
+		assert(hll_loaded.is_sparse == true, "Deserialized sparse data should remain sparse")
 		assert(hll_loaded:estimate() == 2, "Deserialized estimate should match original")
 	end,
 

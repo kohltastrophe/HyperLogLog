@@ -934,7 +934,7 @@ local MINIMUM_PRECISION = 4
 local MAXIMUM_PRECISION = 18
 
 local SPARSE_PRECISION = 25
-local DENSE_THRESHOLD_RATIO = 1 / 8
+local DENSE_THRESHOLD_RATIO = 0.25
 
 local COUNTING_THRESHOLD = table.freeze({
 	10, -- precision 4
@@ -961,6 +961,50 @@ local function linearCountingThreshold(p: number)
 	return 5 * 2 ^ p / 2
 end
 
+local function getVarIntSize(value: number): number
+	if value < 128 then
+		return 1
+	elseif value < 16384 then
+		return 2
+	elseif value < 2097152 then
+		return 3
+	elseif value < 268435456 then
+		return 4
+	end
+	return 5
+end
+
+local function writeVarInt(b: buffer, offset: number, value: number): number
+	local band = bit32.band
+	local bor = bit32.bor
+	local rshift = bit32.rshift
+	local writeu8 = buffer.writeu8
+	while value >= 128 do
+		writeu8(b, offset, bor(band(value, 127), 128))
+		value = rshift(value, 7)
+		offset += 1
+	end
+	writeu8(b, offset, value)
+	return offset + 1
+end
+
+local function readVarInt(b: buffer, offset: number): (number, number)
+	local readu8 = buffer.readu8
+	local band = bit32.band
+	local bor = bit32.bor
+	local lshift = bit32.lshift
+	local result = 0
+	local shift = 0
+	local byte
+	repeat
+		byte = readu8(b, offset)
+		offset += 1
+		result = bor(result, lshift(band(byte, 127), shift))
+		shift += 7
+	until byte < 128
+	return result, offset
+end
+
 local function getAlpha(m: number): number
 	if m == 16 then
 		return 0.673101517
@@ -982,11 +1026,11 @@ local function getDenseBuffer(hll: HyperLogLog): buffer
 	local writeu8 = buffer.writeu8
 
 	local b = buffer.create(1 + hll.m)
-	writeu8(b, 0, hll.p)
+	writeu8(b, 0, hll.p + (if hll.is_sparse then 128 else 0))
 
 	local diff = hll.dense_diff
 	local mask = hll.dense_mask
-	local shift_fix = hll.dense_shift_fix
+	local shift = hll.dense_shift
 
 	for index_sparse, rho_sparse in hll.sparse_registers :: any do
 		local index_dense = rshift(index_sparse, diff)
@@ -996,7 +1040,7 @@ local function getDenseBuffer(hll: HyperLogLog): buffer
 		if residual == 0 then
 			rho_dense = rho_sparse + diff
 		else
-			rho_dense = countlz(lshift(residual, shift_fix)) + 1
+			rho_dense = countlz(lshift(residual, shift)) + 1
 		end
 
 		local ptr = index_dense + 1
@@ -1040,7 +1084,7 @@ export type HLL = {
 	witness_mask_prime: number,
 	dense_diff: number,
 	dense_mask: number,
-	dense_shift_fix: number,
+	dense_shift: number,
 }
 export type HyperLogLog = typeof(setmetatable({} :: HLL, HyperLogLog))
 
@@ -1049,6 +1093,7 @@ local function newRaw(precision: number?): HLL
 	local m = 2 ^ p
 	local p_prime = SPARSE_PRECISION
 	local m_prime = 2 ^ p_prime
+	local diff = p_prime - p
 
 	return {
 		p = p,
@@ -1064,9 +1109,9 @@ local function newRaw(precision: number?): HLL
 		m_prime = m_prime,
 		shift_p_prime = 32 - p_prime,
 		witness_mask_prime = bit32.lshift(1, 32 - p_prime) - 1,
-		dense_diff = p_prime - p,
-		dense_mask = bit32.lshift(1, p_prime - p) - 1,
-		dense_shift_fix = 32 - (p_prime - p),
+		dense_diff = diff,
+		dense_mask = bit32.lshift(1, diff) - 1,
+		dense_shift = 32 - diff,
 	}
 end
 
@@ -1262,7 +1307,7 @@ function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 		local rshift = bit32.rshift
 
 		for idx_sparse, rho_sparse in other.sparse_registers :: { [number]: number } do
-			local idx_dense = rshift(idx_sparse, p_prime - p) + 1
+			local idx_dense = rshift(idx_sparse, diff) + 1
 			local rho_dense = rho_sparse + diff
 			if rho_dense > readu8(b, idx_dense) then
 				writeu8(b, idx_dense, rho_dense)
@@ -1284,10 +1329,42 @@ end
 --- Returns a serialized buffer.
 function HyperLogLog.serialize(self: HyperLogLog): buffer
 	if self.is_sparse then
-		return getDenseBuffer(self)
+		local bor = bit32.bor
+		local lshift = bit32.lshift
+		local values = table.create(self.sparse_count)
+		local count = 0
+		for idx, rho in self.sparse_registers :: { [number]: number } do
+			count += 1
+			values[count] = bor(lshift(idx, 6), rho)
+		end
+
+		table.sort(values)
+
+		local totalSize = 5
+		local prev = 0
+		for _, val in values do
+			local delta = val - prev
+			totalSize += getVarIntSize(delta)
+			prev = val
+		end
+
+		local b = buffer.create(totalSize)
+		buffer.writeu8(b, 0, bor(self.p, 128))
+		buffer.writeu32(b, 1, count)
+
+		local offset = 5
+		prev = 0
+		for _, val in values do
+			local delta = val - prev
+			offset = writeVarInt(b, offset, delta)
+			prev = val
+		end
+
+		return b
 	else
 		local b = buffer.create(buffer.len(self.buffer :: buffer))
 		buffer.copy(b, 0, self.buffer :: buffer)
+		buffer.writeu8(b, 0, self.p) -- Ensure clean header
 		return b
 	end
 end
@@ -1301,24 +1378,62 @@ function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 		return nil
 	end
 
-	local ok, p = pcall(buffer.readu8, data, 0)
+	local ok, header = pcall(buffer.readu8, data, 0)
 	if not ok then
 		warn("Failed to deserialize HyperLogLog: buffer is corrupted or too small")
 		return nil
 	end
 
-	local m = 2 ^ p
-	if buffer.len(data) ~= 1 + m then
-		warn(`Expected buffer length of {1 + m}, got {buffer.len(data)}`)
-		return nil
+	local is_sparse = header >= 128
+	local p = header % 128
+
+	if is_sparse then
+		if buffer.len(data) < 5 then
+			return nil
+		end
+
+		local count = buffer.readu32(data, 1)
+		local hll = newRaw(p)
+		local regs = hll.sparse_registers :: { [number]: number }
+
+		local offset = 5
+		local value = 0
+
+		local readVarInt = readVarInt
+		local band = bit32.band
+		local rshift = bit32.rshift
+
+		local len = buffer.len(data)
+
+		for _ = 1, count do
+			if offset >= len then
+				warn("Malformed sparse buffer: unexpected end of data")
+				return nil
+			end
+
+			local delta, new_offset = readVarInt(data, offset)
+			offset = new_offset
+			value += delta
+
+			regs[rshift(value, 6)] = band(value, 63)
+		end
+
+		hll.sparse_count = count
+		return setmetatable(hll, HyperLogLog)
+	else -- dense
+		local m = 2 ^ p
+		if buffer.len(data) ~= 1 + m then
+			warn(`Expected buffer length of {1 + m}, got {buffer.len(data)}`)
+			return nil
+		end
+
+		local hll = newRaw(p)
+		hll.buffer = data
+		hll.is_sparse = false
+		hll.sparse_registers = nil
+
+		return setmetatable(hll, HyperLogLog)
 	end
-
-	local hll = newRaw(p)
-	hll.buffer = data
-	hll.is_sparse = false
-	hll.sparse_registers = nil
-
-	return setmetatable(hll, HyperLogLog)
 end
 
 return HyperLogLog
