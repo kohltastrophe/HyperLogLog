@@ -974,35 +974,64 @@ local function getVarIntSize(value: number): number
 	return 5
 end
 
-local function writeVarInt(b: buffer, offset: number, value: number): number
-	local band = bit32.band
-	local bor = bit32.bor
-	local rshift = bit32.rshift
-	local writeu8 = buffer.writeu8
-	while value >= 128 do
-		writeu8(b, offset, bor(band(value, 127), 128))
-		value = rshift(value, 7)
-		offset += 1
+local function readVarInt(b: buffer, offset: number): (number, number)
+	local b0 = buffer.readu8(b, offset)
+	if b0 < 128 then
+		return b0, offset + 1
 	end
-	writeu8(b, offset, value)
-	return offset + 1
+
+	local b1 = buffer.readu8(b, offset + 1)
+	if b1 < 128 then
+		return (b0 - 128) + (b1 * 128), offset + 2
+	end
+
+	local b2 = buffer.readu8(b, offset + 2)
+	if b2 < 128 then
+		return (b0 - 128) + (b1 - 128) * 128 + (b2 * 16384), offset + 3
+	end
+
+	local b3 = buffer.readu8(b, offset + 3)
+	if b3 < 128 then
+		return (b0 - 128) + (b1 - 128) * 128 + (b2 - 128) * 16384 + (b3 * 2097152), offset + 4
+	end
+
+	local b4 = buffer.readu8(b, offset + 4)
+	return (b0 - 128) + (b1 - 128) * 128 + (b2 - 128) * 16384 + (b3 - 128) * 2097152 + (b4 * 268435456), offset + 5
 end
 
-local function readVarInt(b: buffer, offset: number): (number, number)
-	local readu8 = buffer.readu8
-	local band = bit32.band
-	local bor = bit32.bor
-	local lshift = bit32.lshift
-	local result = 0
-	local shift = 0
-	local byte
-	repeat
-		byte = readu8(b, offset)
-		offset += 1
-		result = bor(result, lshift(band(byte, 127), shift))
-		shift += 7
-	until byte < 128
-	return result, offset
+local function writeVarInt(b: buffer, offset: number, value: number): number
+	if value < 128 then
+		buffer.writeu8(b, offset, value)
+		return offset + 1
+	elseif value < 16384 then
+		buffer.writeu16(b, offset, (value % 128 + 128) + (value // 128) * 256)
+		return offset + 2
+	elseif value < 2097152 then
+		buffer.writeu16(b, offset, (value % 128 + 128) + ((value // 128) % 128 + 128) * 256)
+		buffer.writeu8(b, offset + 2, value // 16384)
+		return offset + 3
+	elseif value < 268435456 then
+		buffer.writeu32(
+			b,
+			offset,
+			(value % 128 + 128)
+				+ ((value // 128) % 128 + 128) * 256
+				+ ((value // 16384) % 128 + 128) * 65536
+				+ (value // 2097152) * 16777216
+		)
+		return offset + 4
+	else
+		buffer.writeu32(
+			b,
+			offset,
+			(value % 128 + 128)
+				+ ((value // 128) % 128 + 128) * 256
+				+ ((value // 16384) % 128 + 128) * 65536
+				+ (value // 2097152) * 16777216
+		)
+		buffer.writeu8(b, offset + 4, value // 268435456)
+		return offset + 5
+	end
 end
 
 local function getAlpha(m: number): number
